@@ -1,4 +1,3 @@
-cat > README.md << 'EOF'
 # Knowledgebase — PM Onboarding Assistant
 
 RAG-based knowledge assistant helping product managers onboard into new pods. Indexes Confluence docs, Jira tickets, and PDFs; serves queries via a chat interface with gap detection and contributor curation.
@@ -31,7 +30,3 @@ Pilot corpus: PDFs + Markdown. Jira ingestion pending IT access (tracker: <TBD>)
 - Jira ingestion is a stub pending API access — SIT Atlassian returns 404 on tickets the browser can see; IT ticket raised. See ingestion/jira_ingest.py for the full implementation plan.
 - OpenAI embeddings key (OPENAI_API_KEY in .env) is still required for both ingestion and query. With a placeholder key the consumer UI renders but queries will 401.
 - Single-pod focus in this pilot. Cross-pod discovery and multi-tenant metadata filtering are out of scope until the first pod is validated.
-EOF
-# 
-Knowledgebase
-Solving the problem of Knowledge Base for Product managers
