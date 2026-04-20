@@ -22,6 +22,7 @@ Run:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,12 @@ from storage.gaps import (
     claim_gap,
     cluster_gaps,
     resolve_gap,
+)
+from storage.uploads import (
+    MAX_UPLOAD_BYTES,
+    UPLOADS_ROOT,
+    log_upload,
+    save_uploaded_file,
 )
 from storage.sme_directory import add_sme, deactivate_sme, list_smes
 from storage.source_inventory import (
@@ -343,8 +350,151 @@ def _render_answer_editor(selected_pod: Optional[str], pods: list[str]) -> None:
 # --- Tab 3: Sources ---------------------------------------------------------
 
 
+def _llm_key_is_live() -> bool:
+    key = os.getenv("OPENAI_API_KEY", "") or ""
+    return bool(key) and not key.startswith("sk-placeholder")
+
+
+def _process_uploads(
+    uploaded_files: list,
+    pod: str,
+    label: str | None,
+    uploader: str,
+) -> None:
+    """Save each file, log it, and run ingest_pod on the pod's upload dir."""
+    pod_dir = UPLOADS_ROOT / pod
+    saved_paths: list[Path] = []
+
+    with st.status("Processing uploads...", expanded=True) as status:
+        for uploaded in uploaded_files:
+            try:
+                dest = save_uploaded_file(uploaded, pod)
+                saved_paths.append(dest)
+                log_upload(dest.name, pod, uploader, label, uploaded.size, "saved")
+                st.write(f"✅ Saved {uploaded.name} → `{dest}`")
+            except Exception as exc:
+                logger.exception("Failed to save %s", uploaded.name)
+                log_upload(
+                    uploaded.name, pod, uploader, label,
+                    getattr(uploaded, "size", 0),
+                    f"save_error: {exc}",
+                )
+                st.write(f"❌ Save failed for {uploaded.name}: {exc}")
+
+        if not saved_paths:
+            status.update(label="No files saved", state="error")
+            return
+
+        st.write(f"Running ingestion over `{pod_dir}` (pod={pod})...")
+        try:
+            from ingestion.docs_ingest import ingest_pod
+
+            stats = ingest_pod(pod=pod, docs_dir=str(pod_dir))
+            st.write(
+                f"Files processed: **{stats.files_processed}** · "
+                f"skipped (dedup): **{stats.files_skipped_dedup}** · "
+                f"chunks created: **{stats.chunks_created}** · "
+                f"errors: **{stats.errors}**"
+            )
+            if stats.error_files:
+                st.write("Errors on:")
+                for ef in stats.error_files:
+                    st.write(f"  - `{ef}`")
+            is_complete = stats.errors == 0
+            status.update(
+                label=(
+                    f"Ingested {stats.files_processed} file(s), "
+                    f"{stats.chunks_created} chunk(s)"
+                ),
+                state="complete" if is_complete else "error",
+            )
+            st.toast(
+                f"{len(saved_paths)} file(s) saved • {stats.chunks_created} chunk(s) indexed",
+                icon="✅" if is_complete else "⚠️",
+            )
+        except Exception as exc:
+            logger.exception("ingest_pod raised")
+            status.update(label=f"Ingestion error: {exc}", state="error")
+            st.toast("Ingestion failed — see upload log", icon="❌")
+
+
+def _render_upload_section(selected_pod: Optional[str], pods: list[str]) -> None:
+    st.markdown("### Upload documents")
+
+    llm_live = _llm_key_is_live()
+    if not llm_live:
+        st.warning(
+            "OPENAI_API_KEY is a placeholder. Upload accepted, but ingestion "
+            "will fail until a real key is configured. Files are saved to "
+            "./uploads/ regardless — re-run ingestion once the key is live."
+        )
+
+    uploaded = st.file_uploader(
+        "Choose files (PDF / DOCX / Markdown / TXT / HTML)",
+        type=["pdf", "docx", "md", "txt", "html", "htm"],
+        accept_multiple_files=True,
+        key="pm_contrib_src_uploader",
+    )
+
+    pod_options = pods[:]
+    default_idx = 0
+    if selected_pod and selected_pod in pod_options:
+        default_idx = pod_options.index(selected_pod)
+    elif not pod_options:
+        pod_options = ["(type pod below)"]
+
+    c1, c2 = st.columns([1, 2])
+    upload_pod_choice = c1.selectbox(
+        "Tag with pod",
+        pod_options,
+        index=default_idx,
+        key="pm_contrib_src_upload_pod",
+    )
+    pod_text_override = c2.text_input(
+        "...or new pod name (wins if set)",
+        key="pm_contrib_src_upload_pod_new",
+        placeholder="e.g. recharge",
+    )
+    effective_pod = (pod_text_override or "").strip() or upload_pod_choice
+    if effective_pod == "(type pod below)":
+        effective_pod = ""
+
+    label = st.text_input(
+        "Source label (optional)",
+        placeholder="e.g. Q2 PRD v3",
+        key="pm_contrib_src_upload_label",
+    )
+
+    if uploaded:
+        large = [f for f in uploaded if getattr(f, "size", 0) > MAX_UPLOAD_BYTES]
+        if large:
+            st.warning(
+                "Large file(s) (>50MB): "
+                + ", ".join(f.name for f in large)
+                + " — ingestion embedding cost/time will scale with size."
+            )
+
+    if st.button(
+        "Ingest",
+        key="pm_contrib_src_ingest_btn",
+        disabled=not uploaded,
+        type="primary",
+    ):
+        if not effective_pod:
+            st.error("Select a pod from the dropdown or enter one in the text input.")
+            return
+        uploader = st.session_state.get("pm_contrib_user") or "anonymous"
+        _process_uploads(uploaded, effective_pod, label or None, uploader)
+        # Clear the cached pod list so freshly-ingested pods show up.
+        _discover_pods.clear()
+        st.rerun()
+
+
 def _render_sources(pod: Optional[str]) -> None:
     st.subheader("Sources")
+    pods, _total = _discover_pods()
+    _render_upload_section(pod, pods)
+    st.divider()
     sort_by = st.radio(
         "Sort by",
         ["Hits (30d)", "Thumbs-down (30d)"],

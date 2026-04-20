@@ -11,6 +11,7 @@ env/
 chroma_db/
 data/
 docs/
+uploads/
 logs/
 *.jsonl
 .DS_Store
