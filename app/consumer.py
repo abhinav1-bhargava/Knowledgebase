@@ -21,8 +21,17 @@ Run:
 from __future__ import annotations
 
 import logging
+import sys
 import uuid
+from pathlib import Path
 from typing import Any, Optional
+
+# `streamlit run app/consumer.py` only puts app/ on sys.path; the project root
+# isn't added, so `from storage...` / `from config` would fail. Insert the
+# project root up front so sibling packages import cleanly.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import streamlit as st
 
