@@ -90,6 +90,7 @@ def _float_env(name: str, default: float) -> float:
 
 
 _SUPPORTED_PROVIDERS = {"openai", "airtel_bge", "local_hf"}
+_SUPPORTED_LLM_PROVIDERS = {"openai", "airtel"}
 
 # --- Embedding provider (drives which other vars are required) -------------
 EMBEDDING_PROVIDER: str = (os.getenv("EMBEDDING_PROVIDER") or "local_hf").strip().lower()
@@ -97,6 +98,14 @@ if EMBEDDING_PROVIDER not in _SUPPORTED_PROVIDERS:
     raise ConfigError(
         f"Invalid EMBEDDING_PROVIDER {EMBEDDING_PROVIDER!r}. "
         f"Must be one of: {sorted(_SUPPORTED_PROVIDERS)}."
+    )
+
+# --- LLM provider (drives which LLM keys are required) --------------------
+LLM_PROVIDER: str = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+if LLM_PROVIDER not in _SUPPORTED_LLM_PROVIDERS:
+    raise ConfigError(
+        f"Invalid LLM_PROVIDER {LLM_PROVIDER!r}. "
+        f"Must be one of: {sorted(_SUPPORTED_LLM_PROVIDERS)}."
     )
 
 # --- Jira creds (always required) ------------------------------------------
@@ -109,6 +118,8 @@ JIRA_PROJECT_KEY: str = _require("JIRA_PROJECT_KEY")
 OPENAI_API_KEY: str = (os.getenv("OPENAI_API_KEY") or "").strip()
 AIRTEL_EMBEDDING_BASE_URL: str = (os.getenv("AIRTEL_EMBEDDING_BASE_URL") or "").strip()
 AIRTEL_EMBEDDING_API_KEY: str = (os.getenv("AIRTEL_EMBEDDING_API_KEY") or "").strip()
+AIRTEL_LLM_BASE_URL: str = (os.getenv("AIRTEL_LLM_BASE_URL") or "").strip()
+AIRTEL_LLM_API_KEY: str = (os.getenv("AIRTEL_LLM_API_KEY") or "").strip()
 
 # --- Embedding model names --------------------------------------------------
 _DEFAULT_EMBEDDING_MODEL = {
@@ -122,12 +133,8 @@ LOCAL_EMBEDDING_MODEL: str = (
 ).strip()
 
 # --- Provider-specific validation ------------------------------------------
-if EMBEDDING_PROVIDER == "openai":
-    if not OPENAI_API_KEY:
-        raise ConfigError(
-            "EMBEDDING_PROVIDER=openai requires OPENAI_API_KEY in .env."
-        )
-elif EMBEDDING_PROVIDER == "airtel_bge":
+# Embedding side
+if EMBEDDING_PROVIDER == "airtel_bge":
     if not AIRTEL_EMBEDDING_BASE_URL:
         raise ConfigError(
             "EMBEDDING_PROVIDER=airtel_bge requires AIRTEL_EMBEDDING_BASE_URL in .env."
@@ -138,6 +145,24 @@ elif EMBEDDING_PROVIDER == "airtel_bge":
             "(use the literal string 'EMPTY' for the SIT endpoint)."
         )
 # local_hf: no keys required; the model downloads on first use.
+
+# LLM side
+if LLM_PROVIDER == "airtel":
+    if not AIRTEL_LLM_BASE_URL:
+        raise ConfigError(
+            "LLM_PROVIDER=airtel requires AIRTEL_LLM_BASE_URL in .env."
+        )
+    if not AIRTEL_LLM_API_KEY:
+        raise ConfigError(
+            "LLM_PROVIDER=airtel requires AIRTEL_LLM_API_KEY in .env."
+        )
+
+# OPENAI_API_KEY is required whenever any openai-backed path is selected.
+if (EMBEDDING_PROVIDER == "openai" or LLM_PROVIDER == "openai") and not OPENAI_API_KEY:
+    raise ConfigError(
+        "OPENAI_API_KEY required in .env when EMBEDDING_PROVIDER=openai "
+        "or LLM_PROVIDER=openai."
+    )
 
 # --- LLM / vector store / chunking ----------------------------------------
 LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -160,7 +185,10 @@ __all__ = [
     "LOCAL_EMBEDDING_MODEL",
     "AIRTEL_EMBEDDING_BASE_URL",
     "AIRTEL_EMBEDDING_API_KEY",
+    "LLM_PROVIDER",
     "LLM_MODEL",
+    "AIRTEL_LLM_BASE_URL",
+    "AIRTEL_LLM_API_KEY",
     "CHROMA_PATH",
     "CHUNK_SIZE",
     "CHUNK_OVERLAP",

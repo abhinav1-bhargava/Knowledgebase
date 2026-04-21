@@ -31,9 +31,59 @@ from __future__ import annotations
 
 import logging
 from threading import Lock
-from typing import Any
+from typing import Any, List
+
+import requests
+from llama_index.core.bridge.pydantic import Field
+from llama_index.core.embeddings import BaseEmbedding
 
 logger = logging.getLogger(__name__)
+
+
+class OpenAICompatibleEmbedding(BaseEmbedding):
+    """Minimal embedding client for any OpenAI-compatible /v1/embeddings endpoint.
+
+    Unlike llama_index's OpenAIEmbedding, this does NOT validate the
+    model name against a hardcoded enum of OpenAI-branded models — so it
+    works with custom deployments that expose non-OpenAI models
+    (bge-m3, jina, nomic, etc.) behind the standard OpenAI embeddings
+    contract. Used for the airtel_bge provider.
+    """
+
+    api_base: str = Field(description="Base URL, e.g. http://host:port/v1")
+    api_key: str = Field(description="Bearer token value")
+    model_name: str = Field(description="Model name sent in request body")
+    timeout_seconds: int = Field(default=30)
+
+    def _post(self, inputs: List[str]) -> List[List[float]]:
+        url = f"{self.api_base.rstrip('/')}/embeddings"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {"model": self.model_name, "input": inputs}
+        resp = requests.post(
+            url, headers=headers, json=payload, timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
+        return [item["embedding"] for item in items]
+
+    def _get_query_embedding(self, query: str) -> List[float]:
+        return self._post([query])[0]
+
+    def _get_text_embedding(self, text: str) -> List[float]:
+        return self._post([text])[0]
+
+    def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
+        return self._post(texts)
+
+    async def _aget_query_embedding(self, query: str) -> List[float]:
+        return self._get_query_embedding(query)
+
+    async def _aget_text_embedding(self, text: str) -> List[float]:
+        return self._get_text_embedding(text)
 
 _lock = Lock()
 _cached: Any | None = None
@@ -67,12 +117,13 @@ def get_embed_model():
             )
             logger.info("Embedding provider: openai (%s)", EMBEDDING_MODEL)
         elif provider == "airtel_bge":
-            from llama_index.embeddings.openai import OpenAIEmbedding
-
-            model = OpenAIEmbedding(
-                model=EMBEDDING_MODEL or "bge-m3",
-                api_key=AIRTEL_EMBEDDING_API_KEY,
+            # llama_index's OpenAIEmbedding validates the model against a
+            # hardcoded enum of OpenAI-branded models and rejects "bge-m3"
+            # even when api_base is set — so we use our own minimal client.
+            model = OpenAICompatibleEmbedding(
                 api_base=AIRTEL_EMBEDDING_BASE_URL,
+                api_key=AIRTEL_EMBEDDING_API_KEY,
+                model_name=EMBEDDING_MODEL or "bge-m3",
             )
             logger.info(
                 "Embedding provider: airtel_bge (%s at %s)",

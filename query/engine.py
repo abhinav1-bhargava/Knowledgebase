@@ -32,7 +32,7 @@ from typing import Optional
 
 import chromadb
 from llama_index.core import VectorStoreIndex
-from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.llms import ChatMessage, LLMMetadata, MessageRole
 from llama_index.core.vector_stores import (
     FilterOperator,
     MetadataFilter,
@@ -40,12 +40,36 @@ from llama_index.core.vector_stores import (
 )
 from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.chroma import ChromaVectorStore
+
+
+class _OpenAICompatibleLLM(OpenAI):
+    """OpenAI subclass that bypasses llama_index's hardcoded model-name
+    enums for non-OpenAI-branded deployments (Airtel's gpt-oss-120b).
+
+    The parent's `metadata` property looks up context window and chat
+    capability from tables that only contain OpenAI-branded names and
+    raises ValueError for unknown models. We return sensible hardcoded
+    values — gpt-oss-120b is a chat model with a 128K context window.
+    """
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            context_window=128000,
+            num_output=self.max_tokens or -1,
+            is_chat_model=True,
+            is_function_calling_model=False,
+            model_name=self.model,
+        )
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import (
+    AIRTEL_LLM_API_KEY,
+    AIRTEL_LLM_BASE_URL,
     CHROMA_PATH,
     CONFIDENCE_THRESHOLD,
     LLM_MODEL,
+    LLM_PROVIDER,
     OPENAI_API_KEY,
     RETRIEVAL_TOP_K,
 )
@@ -108,9 +132,30 @@ def _get_embed_model():
 
 
 def _get_llm():
+    """Build and cache the LLM client per LLM_PROVIDER.
+
+    airtel → hits the Airtel-hosted OpenAI-compatible endpoint; the
+    llama_index OpenAI class doesn't validate the model name at
+    construction time, so custom model ids (e.g. gpt-oss-120b) work
+    with api_base set.
+    openai → unchanged SaaS path.
+    """
     global _llm
     if _llm is None:
-        _llm = OpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY)
+        provider = (LLM_PROVIDER or "openai").lower()
+        if provider == "airtel":
+            _llm = _OpenAICompatibleLLM(
+                model=LLM_MODEL,
+                api_key=AIRTEL_LLM_API_KEY,
+                api_base=AIRTEL_LLM_BASE_URL,
+            )
+            logger.info(
+                "LLM provider: airtel (model=%s at %s)",
+                LLM_MODEL, AIRTEL_LLM_BASE_URL,
+            )
+        else:
+            _llm = OpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY)
+            logger.info("LLM provider: openai (model=%s)", LLM_MODEL)
     return _llm
 
 
