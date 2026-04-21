@@ -351,16 +351,6 @@ def _render_answer_editor(selected_pod: Optional[str], pods: list[str]) -> None:
 # --- Tab 3: Sources ---------------------------------------------------------
 
 
-def _status_update(status_obj, **kwargs) -> None:
-    """Wrap st.status().update() so bare-mode callers (tests) don't crash
-    when st.status returns None outside a Streamlit runtime."""
-    if status_obj is not None and hasattr(status_obj, "update"):
-        try:
-            status_obj.update(**kwargs)
-        except Exception:
-            pass
-
-
 def _classify_ingest_status(
     rel_name: str, stats,
 ) -> tuple[str, int, str | None]:
@@ -391,7 +381,10 @@ def _process_uploads(
     # Per-upload bookkeeping so we can emit the final record later.
     records: list[dict] = []
 
-    with st.status("Processing uploads...", expanded=True) as status:
+    # Use st.spinner here instead of st.status — the upload section is already
+    # wrapped in an st.expander, and Streamlit doesn't allow nested expanders
+    # (st.status is itself an expander under the hood).
+    with st.spinner("Processing uploads..."):
         for uploaded in uploaded_files:
             upload_id = str(uuid.uuid4())
             size = int(getattr(uploaded, "size", 0) or 0)
@@ -431,7 +424,7 @@ def _process_uploads(
                 st.write(f"❌ Save failed for `{uploaded.name}`: {exc}")
 
         if not records:
-            _status_update(status,label="No files saved", state="error")
+            st.error("No files saved")
             return
 
         st.write(f"Running ingestion over `{pod_dir}` (pod={pod})...")
@@ -456,7 +449,7 @@ def _process_uploads(
                     ingest_status="failed",
                     error_msg=err_text,
                 )
-            _status_update(status,label=f"Ingestion error: {err_text}", state="error")
+            st.error(f"Ingestion error: {err_text}")
             st.warning(
                 f"Files saved to `./uploads/{pod}/`. Ingestion deferred — "
                 f"fix embeddings config and run: "
@@ -487,14 +480,15 @@ def _process_uploads(
             )
 
         is_complete = stats.errors == 0
-        _status_update(status,
-            label=(
-                f"Ingested {stats.files_processed} file(s), "
-                f"{stats.files_skipped_dedup} skipped, "
-                f"{stats.chunks_created} chunk(s)"
-            ),
-            state="complete" if is_complete else "error",
+        summary = (
+            f"Ingested {stats.files_processed} file(s), "
+            f"{stats.files_skipped_dedup} skipped, "
+            f"{stats.chunks_created} chunk(s)"
         )
+        if is_complete:
+            st.success(summary)
+        else:
+            st.error(summary)
         st.toast(
             f"{len(records)} upload(s) • {stats.files_processed} indexed • "
             f"{stats.files_skipped_dedup} dedup • {stats.chunks_created} chunk(s)",
