@@ -38,7 +38,6 @@ from llama_index.core.vector_stores import (
     MetadataFilter,
     MetadataFilters,
 )
-from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -46,11 +45,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from config import (
     CHROMA_PATH,
     CONFIDENCE_THRESHOLD,
-    EMBEDDING_MODEL,
     LLM_MODEL,
     OPENAI_API_KEY,
     RETRIEVAL_TOP_K,
 )
+from query.embed_factory import get_embed_model, verify_collection_dim
 from query.prompts import SYSTEM_PROMPT, build_user_prompt
 from storage.gaps import log_gap
 from storage.query_log import log_query
@@ -101,9 +100,10 @@ def _get_collection():
 
 
 def _get_embed_model():
+    """Delegate to the provider-agnostic embedding factory (cached there)."""
     global _embed_model
     if _embed_model is None:
-        _embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+        _embed_model = get_embed_model()
     return _embed_model
 
 
@@ -139,6 +139,7 @@ def reset_clients() -> None:
 
 def _retrieve(question: str, pod: str | None, top_k: int) -> list[dict]:
     """Retrieve top_k chunks, optionally filtered by pod metadata."""
+    verify_collection_dim(_get_collection())
     index = _get_index()
     filters = None
     if pod:

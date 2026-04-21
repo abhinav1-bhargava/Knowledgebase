@@ -44,7 +44,6 @@ from docx import Document as DocxDocument
 from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pypdf import PdfReader
 
@@ -52,9 +51,8 @@ from config import (
     CHROMA_PATH,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
-    EMBEDDING_MODEL,
-    OPENAI_API_KEY,
 )
+from query.embed_factory import get_embed_model, verify_collection_dim
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +71,12 @@ SUPPORTED_EXTENSIONS: dict[str, str] = {
 
 @dataclass
 class IngestionStats:
-    """Outcome counters for a single ingest run."""
+    """Outcome counters + per-file status lists for a single ingest run.
+
+    The list-valued fields let callers (e.g. the contributor UI's upload
+    flow) attribute a final per-file status back to their own upload
+    records without re-deriving it from file system state.
+    """
 
     files_processed: int = 0
     files_skipped_dedup: int = 0
@@ -81,6 +84,9 @@ class IngestionStats:
     chunks_created: int = 0
     errors: int = 0
     error_files: list[str] = field(default_factory=list)
+    skipped_files: list[str] = field(default_factory=list)
+    processed_files: list[str] = field(default_factory=list)
+    chunks_per_file: dict[str, int] = field(default_factory=dict)
 
 
 # --- File hashing & loaders -------------------------------------------------
@@ -232,6 +238,7 @@ def _ingest_file(
     if _doc_hash_exists(collection, doc_hash):
         logger.info("Skipping %s — identical content already indexed (doc_hash match)", rel_path)
         stats.files_skipped_dedup += 1
+        stats.skipped_files.append(rel_path)
         return
 
     deleted = _delete_chunks_for_path(collection, rel_path, pod)
@@ -275,6 +282,8 @@ def _ingest_file(
 
     stats.files_processed += 1
     stats.chunks_created += len(nodes)
+    stats.processed_files.append(rel_path)
+    stats.chunks_per_file[rel_path] = len(nodes)
     logger.info("Indexed %s -> %d chunk(s)", rel_path, len(nodes))
 
 
@@ -302,13 +311,14 @@ def ingest_pod(pod: str, docs_dir: str = "./docs") -> IngestionStats:
     logger.info("Found %d candidate file(s) under %s", len(files), docs_path)
 
     collection = _get_collection()
+    verify_collection_dim(collection)
     vector_store = ChromaVectorStore(chroma_collection=collection)
     splitter = SentenceSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         paragraph_separator="\n\n",
     )
-    embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    embed_model = get_embed_model()
     pipeline = IngestionPipeline(
         transformations=[splitter, embed_model],
         vector_store=vector_store,

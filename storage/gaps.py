@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -87,11 +86,6 @@ def _cluster_hash(question: str) -> str:
     return hashlib.sha1(question.encode("utf-8")).hexdigest()[:16]
 
 
-def _has_live_openai_key() -> bool:
-    key = os.getenv("OPENAI_API_KEY", "") or ""
-    return bool(key) and not key.startswith("sk-placeholder")
-
-
 def _fuzzy_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
@@ -106,12 +100,17 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _compute_embeddings(questions: list[str]) -> dict[str, list[float]]:
-    """Batch-embed unique questions. Returns empty on any failure (caller falls back to fuzzy)."""
-    try:
-        from config import EMBEDDING_MODEL, OPENAI_API_KEY
-        from llama_index.embeddings.openai import OpenAIEmbedding
+    """Batch-embed unique questions via the provider factory.
 
-        model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+    Returns an empty dict on any failure so callers fall back to fuzzy
+    SequenceMatcher similarity. Keeping this non-raising is important for
+    the contributor UI, which renders the Gap Queue on every tab switch —
+    a transient embedding-service outage shouldn't bork the page.
+    """
+    try:
+        from query.embed_factory import get_embed_model
+
+        model = get_embed_model()
         vectors = model.get_text_embedding_batch(questions)
         return dict(zip(questions, vectors))
     except Exception as exc:
@@ -132,9 +131,9 @@ def cluster_gaps(pod: str | None = None) -> list[GapCluster]:
         return []
 
     unique_qs = sorted({e["question"] for e in entries})
-    emb_map: dict[str, list[float]] = {}
-    if _has_live_openai_key():
-        emb_map = _compute_embeddings(unique_qs)
+    # Try embeddings via the factory; _compute_embeddings returns {} on failure,
+    # in which case we fall back to fuzzy SequenceMatcher.
+    emb_map = _compute_embeddings(unique_qs)
     use_embeddings = bool(emb_map)
     threshold = EMBED_SIM_THRESHOLD if use_embeddings else FUZZY_SIM_THRESHOLD
 
