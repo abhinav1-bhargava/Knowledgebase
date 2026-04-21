@@ -69,6 +69,7 @@ from storage.uploads import (
     log_upload,
     save_uploaded_file,
 )
+import uuid
 from storage.sme_directory import add_sme, deactivate_sme, list_smes
 from storage.source_inventory import (
     deprecate_source,
@@ -350,9 +351,28 @@ def _render_answer_editor(selected_pod: Optional[str], pods: list[str]) -> None:
 # --- Tab 3: Sources ---------------------------------------------------------
 
 
-def _llm_key_is_live() -> bool:
-    key = os.getenv("OPENAI_API_KEY", "") or ""
-    return bool(key) and not key.startswith("sk-placeholder")
+def _status_update(status_obj, **kwargs) -> None:
+    """Wrap st.status().update() so bare-mode callers (tests) don't crash
+    when st.status returns None outside a Streamlit runtime."""
+    if status_obj is not None and hasattr(status_obj, "update"):
+        try:
+            status_obj.update(**kwargs)
+        except Exception:
+            pass
+
+
+def _classify_ingest_status(
+    rel_name: str, stats,
+) -> tuple[str, int, str | None]:
+    """Map a saved file's name against IngestionStats → (status, chunks, error_msg)."""
+    if rel_name in stats.error_files:
+        return "failed", 0, "ingest pipeline reported a parse/embed error"
+    if rel_name in stats.skipped_files:
+        return "skipped_dedup", 0, None
+    if rel_name in stats.processed_files:
+        return "success", stats.chunks_per_file.get(rel_name, 0), None
+    # Ingester never saw the file (shouldn't normally happen).
+    return "failed", 0, "ingester did not visit this file"
 
 
 def _process_uploads(
@@ -361,28 +381,57 @@ def _process_uploads(
     label: str | None,
     uploader: str,
 ) -> None:
-    """Save each file, log it, and run ingest_pod on the pod's upload dir."""
+    """Two-phase upload: save + `pending` log; then ingest + final-status log.
+
+    If `ingest_pod` raises (e.g. dim mismatch, VPN down, misconfig), saved
+    files stay on disk and every pending record flips to `failed` with the
+    exception message, so a later CLI run can retry against ./uploads/.
+    """
     pod_dir = UPLOADS_ROOT / pod
-    saved_paths: list[Path] = []
+    # Per-upload bookkeeping so we can emit the final record later.
+    records: list[dict] = []
 
     with st.status("Processing uploads...", expanded=True) as status:
         for uploaded in uploaded_files:
+            upload_id = str(uuid.uuid4())
+            size = int(getattr(uploaded, "size", 0) or 0)
             try:
                 dest = save_uploaded_file(uploaded, pod)
-                saved_paths.append(dest)
-                log_upload(dest.name, pod, uploader, label, uploaded.size, "saved")
-                st.write(f"✅ Saved {uploaded.name} → `{dest}`")
+                log_upload(
+                    upload_id=upload_id,
+                    filename=uploaded.name,
+                    saved_path=str(dest),
+                    pod=pod,
+                    uploader=uploader,
+                    label=label,
+                    file_size=size,
+                    ingest_status="pending",
+                )
+                records.append({
+                    "upload_id": upload_id,
+                    "filename": uploaded.name,
+                    "saved_path": str(dest),
+                    "rel_name": dest.name,  # key into IngestionStats.*_files
+                    "file_size": size,
+                })
+                st.write(f"⏳ Saved `{dest}` (pending ingest)")
             except Exception as exc:
                 logger.exception("Failed to save %s", uploaded.name)
                 log_upload(
-                    uploaded.name, pod, uploader, label,
-                    getattr(uploaded, "size", 0),
-                    f"save_error: {exc}",
+                    upload_id=upload_id,
+                    filename=uploaded.name,
+                    saved_path="",
+                    pod=pod,
+                    uploader=uploader,
+                    label=label,
+                    file_size=size,
+                    ingest_status="failed",
+                    error_msg=f"save_error: {exc}",
                 )
-                st.write(f"❌ Save failed for {uploaded.name}: {exc}")
+                st.write(f"❌ Save failed for `{uploaded.name}`: {exc}")
 
-        if not saved_paths:
-            status.update(label="No files saved", state="error")
+        if not records:
+            _status_update(status,label="No files saved", state="error")
             return
 
         st.write(f"Running ingestion over `{pod_dir}` (pod={pod})...")
@@ -390,102 +439,133 @@ def _process_uploads(
             from ingestion.docs_ingest import ingest_pod
 
             stats = ingest_pod(pod=pod, docs_dir=str(pod_dir))
-            st.write(
-                f"Files processed: **{stats.files_processed}** · "
-                f"skipped (dedup): **{stats.files_skipped_dedup}** · "
-                f"chunks created: **{stats.chunks_created}** · "
-                f"errors: **{stats.errors}**"
-            )
-            if stats.error_files:
-                st.write("Errors on:")
-                for ef in stats.error_files:
-                    st.write(f"  - `{ef}`")
-            is_complete = stats.errors == 0
-            status.update(
-                label=(
-                    f"Ingested {stats.files_processed} file(s), "
-                    f"{stats.chunks_created} chunk(s)"
-                ),
-                state="complete" if is_complete else "error",
-            )
-            st.toast(
-                f"{len(saved_paths)} file(s) saved • {stats.chunks_created} chunk(s) indexed",
-                icon="✅" if is_complete else "⚠️",
-            )
         except Exception as exc:
+            # Embedding / dim-mismatch / VPN-down / misconfig — treat every
+            # pending record as failed and preserve the files on disk.
             logger.exception("ingest_pod raised")
-            status.update(label=f"Ingestion error: {exc}", state="error")
-            st.toast("Ingestion failed — see upload log", icon="❌")
+            err_text = str(exc)
+            for rec in records:
+                log_upload(
+                    upload_id=rec["upload_id"],
+                    filename=rec["filename"],
+                    saved_path=rec["saved_path"],
+                    pod=pod,
+                    uploader=uploader,
+                    label=label,
+                    file_size=rec["file_size"],
+                    ingest_status="failed",
+                    error_msg=err_text,
+                )
+            _status_update(status,label=f"Ingestion error: {err_text}", state="error")
+            st.warning(
+                f"Files saved to `./uploads/{pod}/`. Ingestion deferred — "
+                f"fix embeddings config and run: "
+                f"`python -m ingestion.docs_ingest --pod {pod} --docs-dir ./uploads/{pod}`"
+            )
+            st.toast("Ingestion failed — files preserved, see warning", icon="❌")
+            return
+
+        # Phase 2 — per-file final status from IngestionStats.
+        for rec in records:
+            status_label, chunks, err = _classify_ingest_status(rec["rel_name"], stats)
+            log_upload(
+                upload_id=rec["upload_id"],
+                filename=rec["filename"],
+                saved_path=rec["saved_path"],
+                pod=pod,
+                uploader=uploader,
+                label=label,
+                file_size=rec["file_size"],
+                ingest_status=status_label,
+                chunks_created=chunks,
+                error_msg=err,
+            )
+            icon = {"success": "✅", "skipped_dedup": "⏭️", "failed": "❌"}[status_label]
+            st.write(
+                f"{icon} `{rec['filename']}` → **{status_label}**"
+                + (f" ({chunks} chunks)" if chunks else "")
+            )
+
+        is_complete = stats.errors == 0
+        _status_update(status,
+            label=(
+                f"Ingested {stats.files_processed} file(s), "
+                f"{stats.files_skipped_dedup} skipped, "
+                f"{stats.chunks_created} chunk(s)"
+            ),
+            state="complete" if is_complete else "error",
+        )
+        st.toast(
+            f"{len(records)} upload(s) • {stats.files_processed} indexed • "
+            f"{stats.files_skipped_dedup} dedup • {stats.chunks_created} chunk(s)",
+            icon="✅" if is_complete else "⚠️",
+        )
 
 
 def _render_upload_section(selected_pod: Optional[str], pods: list[str]) -> None:
-    st.markdown("### Upload documents")
+    with st.expander("📤 Upload new documents", expanded=False):
+        pod_options = pods[:]
+        default_idx = 0
+        if selected_pod and selected_pod in pod_options:
+            default_idx = pod_options.index(selected_pod)
+        elif not pod_options:
+            pod_options = ["(type pod below)"]
 
-    llm_live = _llm_key_is_live()
-    if not llm_live:
-        st.warning(
-            "OPENAI_API_KEY is a placeholder. Upload accepted, but ingestion "
-            "will fail until a real key is configured. Files are saved to "
-            "./uploads/ regardless — re-run ingestion once the key is live."
-        )
+        with st.form("pm_contrib_upload_form", clear_on_submit=False):
+            uploaded = st.file_uploader(
+                "Choose files (PDF / DOCX / Markdown / TXT / HTML)",
+                type=["pdf", "docx", "md", "markdown", "txt", "html", "htm"],
+                accept_multiple_files=True,
+                key="pm_contrib_src_uploader",
+            )
+            c1, c2 = st.columns([1, 2])
+            upload_pod_choice = c1.selectbox(
+                "Tag with pod",
+                pod_options,
+                index=default_idx,
+                key="pm_contrib_src_upload_pod",
+            )
+            pod_text_override = c2.text_input(
+                "...or new pod name (wins if set)",
+                key="pm_contrib_src_upload_pod_new",
+                placeholder="e.g. recharge",
+            )
+            st.text_input(
+                "Source label (optional)",
+                placeholder="e.g. Q2 PRD v3",
+                key="pm_contrib_src_upload_label",
+            )
+            submitted = st.form_submit_button(
+                "Ingest uploaded files", type="primary"
+            )
 
-    uploaded = st.file_uploader(
-        "Choose files (PDF / DOCX / Markdown / TXT / HTML)",
-        type=["pdf", "docx", "md", "txt", "html", "htm"],
-        accept_multiple_files=True,
-        key="pm_contrib_src_uploader",
-    )
+        if not submitted:
+            return
 
-    pod_options = pods[:]
-    default_idx = 0
-    if selected_pod and selected_pod in pod_options:
-        default_idx = pod_options.index(selected_pod)
-    elif not pod_options:
-        pod_options = ["(type pod below)"]
+        # Validate submission.
+        if not uploaded:
+            st.error("Upload at least one file before clicking Ingest.")
+            return
+        effective_pod = (pod_text_override or "").strip() or upload_pod_choice
+        if effective_pod == "(type pod below)":
+            effective_pod = ""
+        if not effective_pod:
+            st.error("Select a pod from the dropdown or enter one in the text input.")
+            return
 
-    c1, c2 = st.columns([1, 2])
-    upload_pod_choice = c1.selectbox(
-        "Tag with pod",
-        pod_options,
-        index=default_idx,
-        key="pm_contrib_src_upload_pod",
-    )
-    pod_text_override = c2.text_input(
-        "...or new pod name (wins if set)",
-        key="pm_contrib_src_upload_pod_new",
-        placeholder="e.g. recharge",
-    )
-    effective_pod = (pod_text_override or "").strip() or upload_pod_choice
-    if effective_pod == "(type pod below)":
-        effective_pod = ""
-
-    label = st.text_input(
-        "Source label (optional)",
-        placeholder="e.g. Q2 PRD v3",
-        key="pm_contrib_src_upload_label",
-    )
-
-    if uploaded:
+        # Large-file warning (informational; doesn't block).
         large = [f for f in uploaded if getattr(f, "size", 0) > MAX_UPLOAD_BYTES]
         if large:
             st.warning(
                 "Large file(s) (>50MB): "
                 + ", ".join(f.name for f in large)
-                + " — ingestion embedding cost/time will scale with size."
+                + " — ingestion embedding cost/time scales with size."
             )
 
-    if st.button(
-        "Ingest",
-        key="pm_contrib_src_ingest_btn",
-        disabled=not uploaded,
-        type="primary",
-    ):
-        if not effective_pod:
-            st.error("Select a pod from the dropdown or enter one in the text input.")
-            return
         uploader = st.session_state.get("pm_contrib_user") or "anonymous"
-        _process_uploads(uploaded, effective_pod, label or None, uploader)
-        # Clear the cached pod list so freshly-ingested pods show up.
+        label = st.session_state.get("pm_contrib_src_upload_label") or None
+        _process_uploads(uploaded, effective_pod, label, uploader)
+        # Cached pod list now stale — fresh pod shows up in sidebar on rerun.
         _discover_pods.clear()
         st.rerun()
 
@@ -799,8 +879,29 @@ def _render_pod_health(pod: Optional[str]) -> None:
 # --- Main -------------------------------------------------------------------
 
 
+def _prewarm_embeddings() -> None:
+    """Trigger the embedding factory once per session so the first upload
+    doesn't freeze on a 130MB first-run HuggingFace download."""
+    if st.session_state.get("pm_embed_prewarmed"):
+        return
+    try:
+        with st.spinner(
+            "Loading embedding model (first run may download ~130MB)..."
+        ):
+            from query.embed_factory import get_embed_model, get_model_dim
+
+            get_embed_model()
+            get_model_dim()  # second call is cached after this
+        st.session_state.pm_embed_prewarmed = True
+    except Exception as exc:
+        # Don't block rendering; downstream try/except paths will surface this
+        # again with more actionable context.
+        logger.warning("Embedding prewarm failed: %s", exc)
+
+
 def main() -> None:
     _init_state()
+    _prewarm_embeddings()
 
     st.title("PM Knowledge Base — Contributor")
     st.text_input(
@@ -839,4 +940,9 @@ def main() -> None:
         _render_pod_health(selected_pod)
 
 
-main()
+# Guarded so `from app.contributor import _process_uploads` doesn't run the
+# whole Streamlit script (which would open forms in bare mode and pollute
+# internal state for subsequent AppTest runs). Both `streamlit run` and
+# AppTest execute scripts with __name__ == "__main__".
+if __name__ == "__main__":
+    main()

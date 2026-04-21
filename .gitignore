@@ -12,6 +12,7 @@ chroma_db/
 data/
 docs/
 uploads/
+upload_log.jsonl
 logs/
 *.jsonl
 .DS_Store

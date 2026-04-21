@@ -310,8 +310,27 @@ def _render_banners(total_chunks: int) -> None:
 # --- Main -------------------------------------------------------------------
 
 
+def _prewarm_embeddings() -> None:
+    """Trigger the embedding factory once per session so the first query
+    doesn't freeze on a 130MB first-run HuggingFace download."""
+    if st.session_state.get("pm_embed_prewarmed"):
+        return
+    try:
+        with st.spinner(
+            "Loading embedding model (first run may download ~130MB)..."
+        ):
+            from query.embed_factory import get_embed_model, get_model_dim
+
+            get_embed_model()
+            get_model_dim()
+        st.session_state.pm_embed_prewarmed = True
+    except Exception as exc:
+        logger.warning("Embedding prewarm failed: %s", exc)
+
+
 def main() -> None:
     _init_state()
+    _prewarm_embeddings()
 
     st.title("PM Onboarding Assistant")
     st.caption(
@@ -346,4 +365,5 @@ def main() -> None:
     st.session_state.pm_messages.append(msg)
 
 
-main()
+if __name__ == "__main__":
+    main()
