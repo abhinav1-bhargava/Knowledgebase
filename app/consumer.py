@@ -33,13 +33,24 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import re
+
 import streamlit as st
 
-st.set_page_config(
-    page_title="PM Onboarding Assistant",
-    layout="wide",
-    initial_sidebar_state="collapsed",
+from design.styles import (
+    apply_design_system,
+    render_badge,
+    render_citation_marker,
+    render_source,
 )
+
+st.set_page_config(
+    page_title="PM Onboarding — Consumer",
+    page_icon=None,
+    layout="wide" if __file__.endswith("contributor.py") else "centered",
+    initial_sidebar_state="expanded",
+)
+apply_design_system()
 
 logger = logging.getLogger(__name__)
 
@@ -176,29 +187,48 @@ def _handle_submission(question: str, pod: Optional[str]) -> dict[str, Any]:
 # --- Rendering helpers ------------------------------------------------------
 
 
-def _confidence_badge(confidence: float) -> str:
-    if confidence >= 0.8:
-        return f"🟢 **Confidence: {confidence:.2f}** (high)"
-    if confidence >= 0.7:
-        return f"🟡 **Confidence: {confidence:.2f}** (medium)"
-    return f"🔴 **Confidence: {confidence:.2f}** (low)"
+_CITATION_PATTERN = re.compile(r"\[([^\[\]]+?)\]")
 
 
-_CITATION_ICON = {
-    "document": "📄",
-    "jira": "🎫",
-    "verified_answer": "✅",
-}
+def _renumber_answer_citations(
+    answer_text: str, citations: list
+) -> tuple[str, list]:
+    """Rewrite LLM-produced ``[identifier]`` markers in the answer into
+    sequentially numbered ``[1]``/``[2]`` citation links and return the
+    corresponding ordered list of Citation objects.
+
+    Identifiers that don't match any known citation pass through unchanged
+    (e.g., the prompt's rule-3 placeholder ``[topic area]``).
+    """
+    ident_to_cit = {c.identifier: c for c in citations}
+    order: list[str] = []
+    ident_to_num: dict[str, int] = {}
+
+    def replace(match: "re.Match[str]") -> str:
+        ident = match.group(1).strip()
+        if ident not in ident_to_cit:
+            return match.group(0)
+        if ident not in ident_to_num:
+            order.append(ident)
+            ident_to_num[ident] = len(order)
+        n = ident_to_num[ident]
+        return render_citation_marker(n, ident)
+
+    rewritten = _CITATION_PATTERN.sub(replace, answer_text)
+    numbered = [ident_to_cit[i] for i in order]
+    # Any citations not referenced inline still get rendered below, after
+    # the ones that are, so every retrieved source remains visible.
+    referenced = set(order)
+    trailing = [c for c in citations if c.identifier not in referenced]
+    return rewritten, numbered + trailing
 
 
-def _render_citation(citation) -> None:
-    icon = _CITATION_ICON.get(citation.type, "📄")
-    if citation.type == "jira" and citation.url:
-        st.markdown(f"{icon} [{citation.identifier}]({citation.url})")
-    else:
-        st.markdown(f"{icon} **{citation.identifier}**")
-    if citation.snippet:
-        st.caption(citation.snippet)
+def _citation_meta_line(citation) -> str:
+    """Short metadata string for the source card header area."""
+    bits = [citation.type]
+    if citation.url:
+        bits.append(citation.url)
+    return " · ".join(bits)
 
 
 def _render_feedback_row(msg: dict[str, Any]) -> None:
@@ -241,15 +271,41 @@ def _render_assistant_turn(msg: dict[str, Any]) -> None:
         return
 
     if result.low_confidence:
-        st.warning("⚠️ Low confidence — verify with an SME before relying on this.")
+        st.warning("Low confidence — verify with an SME before relying on this.")
 
-    st.markdown(result.answer or "_(empty answer)_")
-    st.markdown(_confidence_badge(result.confidence))
+    answer_text = result.answer or "_(empty answer)_"
+    rewritten, ordered_citations = _renumber_answer_citations(
+        answer_text, list(result.citations or [])
+    )
+    st.markdown(rewritten, unsafe_allow_html=True)
 
-    if result.citations:
-        with st.expander(f"Sources ({len(result.citations)})", expanded=False):
-            for cit in result.citations:
-                _render_citation(cit)
+    pct = int(round((result.confidence or 0.0) * 100))
+    if result.confidence >= 0.8:
+        variant = "success"
+    elif result.confidence >= 0.5:
+        variant = "warn"
+    else:
+        variant = "danger"
+    st.markdown(
+        render_badge(f"{pct}% confidence", variant=variant),
+        unsafe_allow_html=True,
+    )
+
+    if ordered_citations:
+        st.markdown(
+            f'<h4 style="margin-top: 20px;">Sources ({len(ordered_citations)})</h4>',
+            unsafe_allow_html=True,
+        )
+        for n, cit in enumerate(ordered_citations, 1):
+            st.markdown(
+                render_source(
+                    num=n,
+                    title=cit.identifier,
+                    meta=_citation_meta_line(cit),
+                    snippet=cit.snippet or "",
+                ),
+                unsafe_allow_html=True,
+            )
 
     if result.follow_ups:
         st.markdown("**Follow-ups:**")
@@ -281,11 +337,6 @@ def _render_sidebar(pods: list[str], total_chunks: int) -> Optional[str]:
         st.session_state.pm_selected_pod = selected_pod
         st.metric("Queries this session", len(st.session_state.pm_messages))
         st.caption(f"Indexed chunks: {total_chunks}")
-        st.divider()
-        st.markdown(
-            "**Contributor view** — run "
-            "`streamlit run app/contributor.py --server.port 8502`."
-        )
     return selected_pod
 
 
@@ -328,6 +379,34 @@ def _prewarm_embeddings() -> None:
         logger.warning("Embedding prewarm failed: %s", exc)
 
 
+_EMPTY_STATE_EXAMPLES = [
+    "What does the recharge flow do?",
+    "What metrics does platform engineering track?",
+    "What's been tried recently with notification delivery?",
+]
+
+
+def _render_empty_state() -> None:
+    st.markdown(
+        '<div class="kb-card" style="text-align:center; padding: 48px 24px; margin-top: 24px;">'
+        '<div style="font-size: 24px; font-weight: 600; color: var(--ink-100); '
+        'letter-spacing: -0.01em; margin-bottom: 8px;">'
+        "Ask about products, features, or technical systems"
+        "</div>"
+        '<div style="font-size: 15px; color: var(--ink-500);">'
+        "Get grounded answers with sources across the division."
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
+    cols = st.columns(len(_EMPTY_STATE_EXAMPLES))
+    for i, q in enumerate(_EMPTY_STATE_EXAMPLES):
+        if cols[i].button(q, key=f"pm_example_q_{i}"):
+            st.session_state.pm_pending_question = q
+            st.rerun()
+
+
 def main() -> None:
     _init_state()
     _prewarm_embeddings()
@@ -340,6 +419,10 @@ def main() -> None:
     pods, total_chunks = _discover_pods()
     selected_pod = _render_sidebar(pods, total_chunks)
     _render_banners(total_chunks)
+
+    # Empty state — first load, no questions yet.
+    if not st.session_state.pm_messages:
+        _render_empty_state()
 
     # Replay chat history
     for past in st.session_state.pm_messages:

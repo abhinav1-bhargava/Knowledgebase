@@ -37,11 +37,22 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
+from design.styles import (
+    apply_design_system,
+    render_citation_marker,
+    render_confidence,
+    render_badge,
+    render_source,
+    render_metric,
+)
+
 st.set_page_config(
-    page_title="PM Knowledge Base — Contributor",
-    layout="wide",
+    page_title="PM Onboarding — Contributor",
+    page_icon=None,
+    layout="wide" if __file__.endswith("contributor.py") else "centered",
     initial_sidebar_state="expanded",
 )
+apply_design_system()
 
 logger = logging.getLogger(__name__)
 
@@ -124,21 +135,55 @@ def _discover_pods() -> tuple[list[str], int]:
 # --- Sidebar ----------------------------------------------------------------
 
 
-def _render_sidebar(pods: list[str], total_chunks: int) -> Optional[str]:
+def _render_top_nav(pods: list[str]) -> Optional[str]:
+    """Consolidated top-nav row: logo · app-name + CONTRIBUTOR tag ·
+    pod selector · user chip. Returns the currently-selected pod.
+
+    This replaces the old title + separate sidebar-pod-selector pattern.
+    """
+    nav = st.columns([0.4, 4, 2.2, 2.2])
+    nav[0].markdown(
+        '<div style="background: var(--ink-900); color: var(--surface); '
+        'width: 32px; height: 32px; border-radius: var(--radius-md); '
+        'display: flex; align-items: center; justify-content: center; '
+        'font-family: var(--font-mono); font-size: 12px; font-weight: 600; '
+        'margin-top: 4px;">KB</div>',
+        unsafe_allow_html=True,
+    )
+    nav[1].markdown(
+        '<div style="font-size: 16px; font-weight: 600; margin-top: 4px;">'
+        "PM Knowledge Base</div>"
+        '<div style="font-size: 11px; color: var(--ink-500); font-family: var(--font-mono); '
+        'text-transform: uppercase; letter-spacing: 0.06em;">CONTRIBUTOR</div>',
+        unsafe_allow_html=True,
+    )
+    options = ["All pods"] + pods
+    selected = nav[2].selectbox(
+        "Pod", options=options, index=0, label_visibility="collapsed"
+    )
+    selected_pod = None if selected == "All pods" else selected
+    st.session_state.pm_contrib_selected_pod = selected_pod
+
+    nav[3].text_input(
+        "Your name",
+        key="pm_contrib_user",
+        label_visibility="collapsed",
+        placeholder="Your name",
+    )
+    st.divider()
+    return selected_pod
+
+
+def _render_sidebar_aux(total_chunks: int) -> None:
+    """Sidebar after the pod selector moved into the top nav: just workspace
+    metadata and a pointer at the consumer app."""
     with st.sidebar:
-        st.header("Settings")
-        options = ["All pods"] + pods
-        selected = st.selectbox("Pod", options=options, index=0)
-        selected_pod = None if selected == "All pods" else selected
-        st.session_state.pm_contrib_selected_pod = selected_pod
+        st.header("Workspace")
         st.caption(f"Indexed chunks: {total_chunks}")
-        st.divider()
         user = st.session_state.get("pm_contrib_user") or "(not set)"
         st.caption(f"Signed in as: {user}")
-        st.markdown(
-            "**Consumer view:** `streamlit run app/consumer.py`"
-        )
-    return selected_pod
+        st.divider()
+        st.markdown("**Consumer view:** `streamlit run app/consumer.py`")
 
 
 # --- Tab 1: Gap Queue -------------------------------------------------------
@@ -785,13 +830,26 @@ def _render_pod_health(pod: Optional[str]) -> None:
     open_gaps = [c for c in clusters if c.latest_status == "open"]
     published_answers = list_answers(pod=pod, status="Published")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Queries (7d)", len(queries_7d))
+    # 4-up metric row using the design-system card instead of st.metric
     high = sum(1 for q in queries_7d if not q.get("low_confidence", False))
     pct = (high / len(queries_7d) * 100.0) if queries_7d else 0.0
-    c2.metric("% high-confidence (7d)", f"{pct:.0f}%")
-    c3.metric("Open gaps", len(open_gaps))
-    c4.metric("Verified answers (published)", len(published_answers))
+    metric_cols = st.columns(4)
+    metric_cols[0].markdown(
+        render_metric("Queries (7d)", str(len(queries_7d))),
+        unsafe_allow_html=True,
+    )
+    metric_cols[1].markdown(
+        render_metric("% high-confidence (7d)", f"{pct:.0f}%"),
+        unsafe_allow_html=True,
+    )
+    metric_cols[2].markdown(
+        render_metric("Open gaps", str(len(open_gaps))),
+        unsafe_allow_html=True,
+    )
+    metric_cols[3].markdown(
+        render_metric("Verified answers (published)", str(len(published_answers))),
+        unsafe_allow_html=True,
+    )
 
     st.divider()
 
@@ -802,13 +860,19 @@ def _render_pod_health(pod: Optional[str]) -> None:
         df["date"] = pd.to_datetime(df["timestamp"], errors="coerce").dt.date
         df = df.dropna(subset=["date"])
         volume = df.groupby("date").size().rename("queries")
-        st.markdown("### Daily query volume (30d)")
-        st.line_chart(volume)
-
         df["low"] = df.get("low_confidence", False).fillna(False).astype(int)
         low_pct = df.groupby("date")["low"].mean().mul(100.0).rename("% low-confidence")
-        st.markdown("### Daily % low-confidence (30d)")
-        st.line_chart(low_pct)
+
+        # Two side-by-side line charts, each in a bordered container.
+        chart_cols = st.columns(2)
+        with chart_cols[0]:
+            st.markdown("#### Daily query volume (30d)")
+            with st.container(border=True):
+                st.line_chart(volume)
+        with chart_cols[1]:
+            st.markdown("#### Daily % low-confidence (30d)")
+            with st.container(border=True):
+                st.line_chart(low_pct)
 
     if open_gaps:
         try:
@@ -897,25 +961,28 @@ def main() -> None:
     _init_state()
     _prewarm_embeddings()
 
-    st.title("PM Knowledge Base — Contributor")
-    st.text_input(
-        "Your name",
-        key="pm_contrib_user",
-        placeholder="e.g. Ravi K. (free text, no auth)",
-    )
-
     pods, total_chunks = _discover_pods()
-    selected_pod = _render_sidebar(pods, total_chunks)
+    selected_pod = _render_top_nav(pods)
+    _render_sidebar_aux(total_chunks)
 
     if _CONFIG_ERROR:
         st.error(f"Configuration error — {_CONFIG_ERROR}")
 
+    # Pre-compute counts so tab labels can show them. Duplicates the body's
+    # own call for the same pod (cluster_gaps / list_sources / list_answers)
+    # — acceptable for the prototype, easy to memoize via @st.cache_data
+    # later if the airtel_bge embedding path makes these calls expensive.
+    _clusters = cluster_gaps(pod=selected_pod)
+    _open_gap_count = sum(1 for c in _clusters if c.latest_status == "open")
+    _source_count = len(list_sources(pod=selected_pod))
+    _verified_count = len(list_answers(pod=selected_pod, status="Published"))
+
     tabs = st.tabs(
         [
-            "Gap Queue",
+            f"Gap Queue ({_open_gap_count})",
             "Answer Editor",
-            "Sources",
-            "Verified Answers",
+            f"Sources ({_source_count})",
+            f"Verified Answers ({_verified_count})",
             "SME Directory",
             "Pod Health",
         ]
