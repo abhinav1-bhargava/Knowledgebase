@@ -278,7 +278,28 @@ def _render_assistant_turn(msg: dict[str, Any]) -> None:
     rewritten, ordered_citations = _renumber_answer_citations(
         answer_text, list(result.citations or [])
     )
-    st.markdown(rewritten, unsafe_allow_html=True)
+
+    if st.session_state.pm_show_sources:
+        st.markdown(rewritten, unsafe_allow_html=True)
+    else:
+        # Strip every citation-shaped artifact so the prose is clean:
+        #   1. HTML anchor tags produced by render_citation_marker on
+        #      successful renumbering (<a class="citation-marker" …>N</a>).
+        #   2. Literal [1] / [2] numeric markers if any leaked through.
+        #   3. Any remaining [identifier]/[filename] brackets that passed
+        #      through when the LLM's bracket content didn't match a
+        #      known Citation identifier.
+        # Then tighten trailing spaces before punctuation and collapse
+        # runs of spaces/tabs — but preserve paragraph breaks.
+        clean_answer = re.sub(
+            r'<a class="citation-marker"[^>]*>.*?</a>', "", rewritten,
+        )
+        clean_answer = re.sub(r"\[\d+\]", "", clean_answer)
+        clean_answer = re.sub(r"\[[^\[\]]*?\]", "", clean_answer)
+        clean_answer = re.sub(r"[ \t]+([.,;:!?])", r"\1", clean_answer)
+        clean_answer = re.sub(r"[ \t]+", " ", clean_answer)
+        clean_answer = re.sub(r"\n{3,}", "\n\n", clean_answer).strip()
+        st.markdown(clean_answer, unsafe_allow_html=True)
 
     pct = int(round((result.confidence or 0.0) * 100))
     if result.confidence >= 0.8:
