@@ -125,6 +125,7 @@ def _init_state() -> None:
     st.session_state.setdefault("pm_user", "")
     st.session_state.setdefault("pm_selected_pod", None)
     st.session_state.setdefault("pm_pending_question", None)
+    st.session_state.setdefault("pm_show_sources", False)
 
 
 # --- Submission dispatch (slash commands + plain queries) -------------------
@@ -291,7 +292,7 @@ def _render_assistant_turn(msg: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    if ordered_citations:
+    if st.session_state.pm_show_sources and ordered_citations:
         st.markdown(
             f'<h4 style="margin-top: 20px;">Sources ({len(ordered_citations)})</h4>',
             unsafe_allow_html=True,
@@ -335,6 +336,7 @@ def _render_sidebar(pods: list[str], total_chunks: int) -> Optional[str]:
         )
         selected_pod = None if selected == "All pods" else selected
         st.session_state.pm_selected_pod = selected_pod
+        st.toggle("Show sources", key="pm_show_sources")
         st.metric("Queries this session", len(st.session_state.pm_messages))
         st.caption(f"Indexed chunks: {total_chunks}")
     return selected_pod
