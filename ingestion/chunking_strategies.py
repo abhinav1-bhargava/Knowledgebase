@@ -40,6 +40,7 @@ SUPPORTED_CHUNKING_STRATEGIES: tuple[str, ...] = (
     "fixed_768",
     "fixed_1024",
     "semantic",
+    "sentence_window",
 )
 
 # Canonical per-strategy (chunk_size, chunk_overlap) for the fixed variants.
@@ -58,6 +59,7 @@ DEFAULT_COLLECTION_BY_STRATEGY: dict[str, str] = {
     "fixed_768": "kb_768",
     "fixed_1024": "kb_1024",
     "semantic": "kb_semantic",
+    "sentence_window": "kb_sentence_window",
 }
 
 
@@ -96,6 +98,14 @@ def build_splitter(strategy: str, embed_model: Any | None = None):
             breakpoint_percentile_threshold=95,
             embed_model=embed_model,
         )
+
+    if strategy == "sentence_window":
+        # Lazy-imported because NLTK bootstraps punkt on first use and
+        # that work is wasted for the fixed-chunking path.
+        from ingestion.sentence_chunker import SentenceIndexNodeParser
+
+        logger.info("Building SentenceIndexNodeParser (one node per sentence)")
+        return SentenceIndexNodeParser()
 
     raise ValueError(
         f"Unknown chunking strategy {strategy!r}. "

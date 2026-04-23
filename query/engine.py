@@ -607,6 +607,120 @@ def query_reranked(
     return _generate_from_chunks(question, reranked, pod, start=start)
 
 
+def _fetch_sentence_window(
+    col,
+    doc_hash: str,
+    center_index: int,
+    window: int,
+    total_sentences: int | None,
+) -> tuple[str, int, int]:
+    """Fetch sentences within [center - window, center + window] from one doc.
+
+    Returns (joined_text, start_idx, end_idx). Empty string if the
+    Chroma query fails or returns nothing — caller should fall back to
+    the center sentence alone.
+    """
+    start_idx = max(0, center_index - window)
+    if total_sentences is not None:
+        end_idx = min(total_sentences - 1, center_index + window)
+    else:
+        end_idx = center_index + window
+
+    try:
+        result = col.get(
+            where={
+                "$and": [
+                    {"doc_hash": doc_hash},
+                    {"sentence_index": {"$gte": start_idx}},
+                    {"sentence_index": {"$lte": end_idx}},
+                ]
+            },
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        logger.warning("Sentence-window fetch failed for doc_hash=%s: %s", doc_hash, exc)
+        return "", start_idx, end_idx
+
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+    if not docs:
+        return "", start_idx, end_idx
+
+    # Order by sentence_index so the concatenated text reads naturally.
+    ordered = sorted(
+        zip(metas, docs),
+        key=lambda pair: (pair[0] or {}).get("sentence_index", 0),
+    )
+    joined = " ".join(d for _, d in ordered)
+    return joined, start_idx, end_idx
+
+
+def query_sentence_window(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+    window: int = 2,
+) -> QueryResult:
+    """Sentence-window retrieval: match sentence, expand ±window for context.
+
+    Expects a collection ingested with `chunking_strategy="sentence_window"`
+    so each chunk is a single sentence carrying `doc_hash`,
+    `sentence_index`, and `total_sentences` metadata. For each top-K
+    vector hit, we issue a metadata-filtered `collection.get` pulling the
+    ±window sentences from the same document, concatenate them in order,
+    and hand the expanded chunks to the shared generation path.
+
+    The vector `score` from the center-sentence match is preserved on
+    each expanded chunk so downstream confidence remains comparable.
+    """
+    from ingestion.chunking_strategies import DEFAULT_COLLECTION_BY_STRATEGY
+
+    start = time.time()
+    effective_top_k = top_k or 5  # spec default for sentence-window is 5
+    target_collection = (
+        collection_name or DEFAULT_COLLECTION_BY_STRATEGY["sentence_window"]
+    )
+
+    hits = _retrieve(question, pod, effective_top_k, collection_name=target_collection)
+    if not hits:
+        return _generate_from_chunks(question, [], pod, start=start)
+
+    col = _get_collection_by_name(target_collection)
+
+    expanded: list[dict] = []
+    for hit in hits:
+        meta = hit.get("metadata") or {}
+        doc_hash = meta.get("doc_hash")
+        sent_idx = meta.get("sentence_index")
+        total = meta.get("total_sentences")
+
+        if doc_hash is None or sent_idx is None:
+            # Not a sentence-window chunk (collection may be mis-routed);
+            # keep the original hit so we don't silently drop context.
+            expanded.append(hit)
+            continue
+
+        joined, win_start, win_end = _fetch_sentence_window(
+            col, doc_hash, int(sent_idx), window, total,
+        )
+        text = joined if joined else (hit.get("text") or "")
+
+        expanded_meta = {
+            **meta,
+            "window_start": win_start,
+            "window_end": win_end,
+            "window_size": window,
+        }
+        expanded.append({
+            "text": text,
+            "score": hit.get("score", 0.0),
+            "metadata": expanded_meta,
+        })
+
+    return _generate_from_chunks(question, expanded, pod, start=start)
+
+
 def query_agentic(
     question: str,
     pod: str | None = None,
