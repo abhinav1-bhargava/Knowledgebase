@@ -153,20 +153,44 @@ def _collection_inventory() -> dict[str, dict]:
 def _render_sidebar() -> None:
     with st.sidebar:
         st.header("Collections")
+        st.caption(
+            "Collections must be built before use. Click **Ingest** to populate."
+        )
+
         inventory = _collection_inventory()
         for label, info in inventory.items():
-            if info["exists"]:
-                st.success(f"{label} → `{info['collection']}` · {info['count']} chunks")
-            else:
-                st.warning(f"{label} → `{info['collection']}` · not built")
-                strategy_key = _strategy_key_for_sidebar_label(label)
+            collection = info["collection"]
+            count = info["count"]
+            # "Empty" = never built OR built-but-zero-chunks. Both mean the
+            # user needs to populate before querying this collection.
+            is_empty = (not info["exists"]) or count == 0
+            strategy_key = _strategy_key_for_sidebar_label(label)
+
+            if is_empty:
+                status_line = (
+                    "not built" if not info["exists"] else "0 chunks"
+                )
+                st.warning(
+                    f"⚠️ **{label}** — `{collection}` · {status_line}"
+                )
+                st.caption("Upload docs via Contributor UI first, then click here.")
                 if strategy_key is not None:
-                    btn_key = f"pm_lab_reingest_{info['collection']}"
                     if st.button(
-                        f"Re-ingest into `{info['collection']}`",
-                        key=btn_key,
+                        "📥 Ingest Documents",
+                        type="primary",
+                        key=f"pm_lab_ingest_{collection}",
+                        use_container_width=True,
                     ):
-                        _run_reingest(strategy_key, info["collection"])
+                        _run_reingest(strategy_key, collection)
+            else:
+                st.success(f"✅ **{label}** — {count:,} chunks")
+                if strategy_key is not None:
+                    if st.button(
+                        "🔄 Rebuild",
+                        type="secondary",
+                        key=f"pm_lab_rebuild_{collection}",
+                    ):
+                        _run_reingest(strategy_key, collection)
 
         st.divider()
         st.caption(
