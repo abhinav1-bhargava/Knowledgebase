@@ -607,6 +607,47 @@ def query_reranked(
     return _generate_from_chunks(question, reranked, pod, start=start)
 
 
+def query_agentic(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+) -> QueryResult:
+    """Agentic RAG — classify then dispatch to the right retrieval path.
+
+    The classifier (query.router.classify_question) places each question
+    into one of {metrics, procedural, debugging, conceptual}; the router
+    dispatches:
+
+        metrics    → query_hybrid     (keyword-heavy, BM25 helps on
+                                       specific numbers + KPI names)
+        procedural → query_hybrid     (keyword-heavy, step names matter)
+        debugging  → query_reranked   (semantic disambiguation across
+                                       many near-miss error patterns)
+        conceptual → query_naive      (vanilla vector works best)
+
+    Classifier failures degrade to `conceptual` → naive, so worst case
+    this is naive RAG plus one extra LLM call for classification.
+    """
+    from query.router import classify_question
+
+    category = classify_question(question)
+    logger.info("Agentic router dispatch: category=%s", category)
+
+    if category in ("metrics", "procedural"):
+        return query_hybrid(
+            question, pod=pod, collection_name=collection_name, top_k=top_k,
+        )
+    if category == "debugging":
+        return query_reranked(
+            question, pod=pod, collection_name=collection_name, top_k=top_k,
+        )
+    # conceptual + any unexpected fallback
+    return query_naive(
+        question, pod=pod, collection_name=collection_name, top_k=top_k,
+    )
+
+
 # --- CLI --------------------------------------------------------------------
 
 
