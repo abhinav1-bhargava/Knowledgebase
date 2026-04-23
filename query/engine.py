@@ -591,6 +591,19 @@ def query_reranked(
         return _generate_from_chunks(question, [], pod, start=start)
 
     reranked = rerank(question, candidates, top_k=effective_top_k)
+
+    # Swap the vector-cosine `score` for a sigmoid-normalised rerank_score
+    # so downstream confidence (mean of `score` in _generate_from_chunks)
+    # reflects the cross-encoder's relevance judgment on a 0–1 scale.
+    # ms-marco-MiniLM outputs raw logits (~[-10, +10]); sigmoid maps
+    # typical good-match logits (5–10) to ~0.99+ and poor matches
+    # (< 0) to ~0.1, matching the confidence-badge thresholds.
+    import math
+
+    for c in reranked:
+        rs = c.get("rerank_score", 0.0)
+        c["score"] = 1.0 / (1.0 + math.exp(-rs))
+
     return _generate_from_chunks(question, reranked, pod, start=start)
 
 
