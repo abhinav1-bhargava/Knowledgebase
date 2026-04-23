@@ -485,6 +485,77 @@ def query_with_rewriting(
     return _generate_from_chunks(question, deduped, pod, start=start)
 
 
+# How wide to cast the net before fusion — larger = more headroom for
+# re-ranking / BM25 overlap, but linearly more expensive. Kept at ≥50 per
+# the spec.
+_HYBRID_CANDIDATES_PER_SOURCE = 50
+# 60/40 vector/keyword blend. Tuning knob — raise alpha for semantic-
+# dominant corpora, lower for specific-term-heavy ones.
+_HYBRID_VECTOR_WEIGHT = 0.6
+_HYBRID_BM25_WEIGHT = 0.4
+
+
+def query_hybrid(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+) -> QueryResult:
+    """Hybrid RAG: vector top-50 ⊕ BM25 top-50, fused by normalised
+    score, then top-K into the shared generation path.
+
+    Score fusion is a 60/40 weighted sum over min-max-normalised scores
+    (each signal's own max becomes 1.0, so the two scales can be added
+    without one swamping the other). Documents that show up in BOTH
+    retrievals get both contributions.
+
+    First call for a given collection builds the BM25 index on demand
+    (see query.bm25_index.search_bm25); subsequent calls reuse the
+    pickle. BM25 doesn't filter server-side by pod, so when a pod
+    filter is in play we drop non-matching BM25 hits post-hoc.
+    """
+    from query.bm25_index import search_bm25
+
+    start = time.time()
+    effective_top_k = top_k or RETRIEVAL_TOP_K
+    target_collection = collection_name or COLLECTION_NAME
+    wide_k = max(_HYBRID_CANDIDATES_PER_SOURCE, effective_top_k * 4)
+
+    vector_hits = _retrieve(question, pod, wide_k, collection_name=collection_name)
+    bm25_hits = search_bm25(question, target_collection, top_k=wide_k)
+    if pod:
+        bm25_hits = [(doc, s, md) for (doc, s, md) in bm25_hits if md.get("pod") == pod]
+
+    max_vec = max((h["score"] for h in vector_hits), default=0.0) or 1.0
+    max_bm = max((s for (_, s, _) in bm25_hits), default=0.0) or 1.0
+
+    fused: dict[str, dict] = {}
+    for hit in vector_hits:
+        key = hit.get("text") or ""
+        if not key:
+            continue
+        fused[key] = {
+            "text": hit["text"],
+            "score": _HYBRID_VECTOR_WEIGHT * (hit["score"] / max_vec),
+            "metadata": hit["metadata"],
+        }
+    for doc, raw_score, md in bm25_hits:
+        if not doc:
+            continue
+        contribution = _HYBRID_BM25_WEIGHT * (raw_score / max_bm)
+        if doc in fused:
+            fused[doc]["score"] += contribution
+        else:
+            fused[doc] = {
+                "text": doc,
+                "score": contribution,
+                "metadata": md or {},
+            }
+
+    top = sorted(fused.values(), key=lambda c: c["score"], reverse=True)[:effective_top_k]
+    return _generate_from_chunks(question, top, pod, start=start)
+
+
 # --- CLI --------------------------------------------------------------------
 
 

@@ -13,6 +13,7 @@ data/
 docs/
 uploads/
 upload_log.jsonl
+bm25_indices/
 logs/
 *.jsonl
 .DS_Store
