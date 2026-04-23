@@ -38,7 +38,7 @@ st.set_page_config(
     page_title="RAG Experimentation Lab",
     page_icon=None,
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 apply_design_system()
 
@@ -114,124 +114,60 @@ def _init_state() -> None:
     st.session_state.setdefault("pm_lab_pod", "All pods")
 
 
-# --- Collection inventory sidebar -------------------------------------------
+# --- Collection auto-build --------------------------------------------------
 
 
-@st.cache_data(ttl=15)
-def _collection_inventory() -> dict[str, dict]:
-    """Return {chunking_label: {collection, exists, count}} for every chunking."""
+def _resolve_strategy_and_collection(
+    retrieval: str, chunking: str,
+) -> tuple[str, str, str]:
+    """Return (chunking_strategy_key, collection_name, friendly_label).
+
+    Sentence-window retrieval always ingests/queries kb_sentence_window
+    regardless of the chunking radio — its one-sentence-per-chunk format
+    is incompatible with the fixed/semantic splitters.
+    """
+    if retrieval == "Sentence Window":
+        return ("sentence_window", SENTENCE_WINDOW_COLLECTION, "Sentence Window")
+    return (
+        CHUNKING_TO_STRATEGY_KEY[chunking],
+        CHUNKING_TO_COLLECTION[chunking],
+        chunking,
+    )
+
+
+def _ensure_collection_populated(retrieval: str, chunking: str) -> None:
+    """Build the target collection from ./uploads if it's empty.
+
+    Idempotent — returns fast when the collection already has chunks.
+    When a build is needed, wraps ingest_pod in an st.spinner so the
+    user gets a clear progress signal; downstream Chroma/BM25 state
+    lands naturally via the existing post-ingest auto-rebuild hook.
+    """
     import chromadb
 
-    try:
-        from config import CHROMA_PATH
+    from config import CHROMA_PATH
 
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
-        existing = {c.name: c for c in client.list_collections()}
-    except Exception as exc:
-        logger.exception("Failed to list Chroma collections: %s", exc)
-        existing = {}
+    strategy_key, collection, friendly = _resolve_strategy_and_collection(
+        retrieval, chunking,
+    )
 
-    inventory: dict[str, dict] = {}
-    for label, collection_name in CHUNKING_TO_COLLECTION.items():
-        col = existing.get(collection_name)
-        inventory[label] = {
-            "collection": collection_name,
-            "exists": col is not None,
-            "count": col.count() if col is not None else 0,
-        }
-    # Sentence-window is shared by the Sentence Window strategy regardless
-    # of chunking; include it in the sidebar summary.
-    col = existing.get(SENTENCE_WINDOW_COLLECTION)
-    inventory["(sentence-window strategy)"] = {
-        "collection": SENTENCE_WINDOW_COLLECTION,
-        "exists": col is not None,
-        "count": col.count() if col is not None else 0,
-    }
-    return inventory
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    col = client.get_or_create_collection(name=collection)
+    if col.count() > 0:
+        return
 
-
-def _render_sidebar() -> None:
-    with st.sidebar:
-        st.header("Collections")
-        st.caption(
-            "Collections must be built before use. Click **Ingest** to populate."
-        )
-
-        inventory = _collection_inventory()
-        for label, info in inventory.items():
-            collection = info["collection"]
-            count = info["count"]
-            # "Empty" = never built OR built-but-zero-chunks. Both mean the
-            # user needs to populate before querying this collection.
-            is_empty = (not info["exists"]) or count == 0
-            strategy_key = _strategy_key_for_sidebar_label(label)
-
-            if is_empty:
-                status_line = (
-                    "not built" if not info["exists"] else "0 chunks"
-                )
-                st.warning(
-                    f"⚠️ **{label}** — `{collection}` · {status_line}"
-                )
-                st.caption("Upload docs via Contributor UI first, then click here.")
-                if strategy_key is not None:
-                    if st.button(
-                        "📥 Ingest Documents",
-                        type="primary",
-                        key=f"pm_lab_ingest_{collection}",
-                        use_container_width=True,
-                    ):
-                        _run_reingest(strategy_key, collection)
-            else:
-                st.success(f"✅ **{label}** — {count:,} chunks")
-                if strategy_key is not None:
-                    if st.button(
-                        "🔄 Rebuild",
-                        type="secondary",
-                        key=f"pm_lab_rebuild_{collection}",
-                    ):
-                        _run_reingest(strategy_key, collection)
-
-        st.divider()
-        st.caption(
-            "Fixed strategies use SentenceSplitter at 512/768/1024 char "
-            "chunks. Semantic splits on topic boundaries. Sentence-window "
-            "chunks per sentence and expands ±2 sentences at retrieval."
-        )
-
-
-def _strategy_key_for_sidebar_label(label: str) -> str | None:
-    """Map sidebar labels to the ingestion strategy key."""
-    if label in CHUNKING_TO_STRATEGY_KEY:
-        return CHUNKING_TO_STRATEGY_KEY[label]
-    if label == "(sentence-window strategy)":
-        return "sentence_window"
-    return None
-
-
-def _run_reingest(chunking_strategy: str, collection_name: str) -> None:
     with st.spinner(
-        f"Re-ingesting ./docs into `{collection_name}` "
-        f"with strategy `{chunking_strategy}`… (may take a few minutes)"
+        f"Building {friendly} collection for first use… "
+        "(one-time, may take 30–120s)"
     ):
-        try:
-            from ingestion.docs_ingest import ingest_pod
+        from ingestion.docs_ingest import ingest_pod
 
-            stats = ingest_pod(
-                pod="all",
-                docs_dir="./docs",
-                chunking_strategy=chunking_strategy,
-                collection_name=collection_name,
-            )
-            st.success(
-                f"Ingested {stats.files_processed} file(s) · "
-                f"{stats.chunks_created} chunk(s) · errors: {stats.errors}"
-            )
-            _collection_inventory.clear()
-            st.rerun()
-        except Exception as exc:
-            logger.exception("Re-ingest failed")
-            st.error(f"Re-ingest failed: {exc}")
+        ingest_pod(
+            pod="all",
+            docs_dir="./uploads",
+            chunking_strategy=strategy_key,
+            collection_name=collection,
+        )
 
 
 # --- Pod options ------------------------------------------------------------
@@ -347,11 +283,30 @@ def _run_one_config(
     pod_filter: str | None,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Execute one query and return a dict of result fields for display."""
+    """Execute one query and return a dict of result fields for display.
+
+    Auto-builds the target collection on first use (st.spinner frames
+    the one-off ingest from ./uploads) so the user never has to
+    pre-populate. Subsequent calls with the same (retrieval, chunking)
+    combination short-circuit the build and jump straight to the query.
+    """
     retrieval = config["retrieval"]
     chunking = config["chunking"]
     top_k = int(config["top_k"])
     collection = _resolve_collection(retrieval, chunking)
+
+    # First-use build: no-op when the collection already has chunks.
+    try:
+        _ensure_collection_populated(retrieval, chunking)
+    except Exception as exc:
+        logger.exception("Auto-ingest failed for config %s", config.get("label"))
+        return {
+            "config": config,
+            "collection": collection,
+            "result": None,
+            "error": f"Auto-ingest failed: {exc}",
+            "latency": 0.0,
+        }
 
     query_fn = _get_query_function(retrieval)
     start = time.time()
@@ -436,7 +391,6 @@ def _render_result(col, payload: dict[str, Any]) -> None:
 
 def main() -> None:
     _init_state()
-    _render_sidebar()
 
     st.title("RAG Experimentation Lab")
     st.caption(
