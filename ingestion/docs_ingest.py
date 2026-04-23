@@ -43,20 +43,23 @@ from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
 from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
-from llama_index.core.node_parser import SentenceSplitter
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pypdf import PdfReader
 
 from config import (
     CHROMA_PATH,
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
+)
+from ingestion.chunking_strategies import (
+    DEFAULT_COLLECTION_BY_STRATEGY,
+    SUPPORTED_CHUNKING_STRATEGIES,
+    build_splitter,
 )
 from query.embed_factory import get_embed_model, verify_collection_dim
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "pm_onboarding"
+COLLECTION_NAME = "pm_onboarding"  # default / back-compat; overridable via ingest_pod(collection_name=...)
+DEFAULT_CHUNKING_STRATEGY = "fixed_512"
 
 SUPPORTED_EXTENSIONS: dict[str, str] = {
     ".pdf": "pdf",
@@ -179,10 +182,10 @@ LOADERS: dict[str, Callable[[Path], list[Document]]] = {
 # --- Chroma helpers ---------------------------------------------------------
 
 
-def _get_collection():
-    """Return (creating if needed) the persistent pm_onboarding collection."""
+def _get_collection(collection_name: str = COLLECTION_NAME):
+    """Return (creating if needed) the named persistent collection."""
     client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+    return client.get_or_create_collection(name=collection_name)
 
 
 def _doc_hash_exists(collection, doc_hash: str) -> bool:
@@ -290,12 +293,33 @@ def _ingest_file(
 # --- Public API -------------------------------------------------------------
 
 
-def ingest_pod(pod: str, docs_dir: str = "./docs") -> IngestionStats:
-    """Ingest all supported documents under docs_dir for the given pod.
+def ingest_pod(
+    pod: str,
+    docs_dir: str = "./docs",
+    chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
+    collection_name: str | None = None,
+) -> IngestionStats:
+    """Ingest all supported documents under `docs_dir` into the named collection.
 
-    Creates docs_dir if it does not exist. Returns an IngestionStats with
-    counters describing the run; does not raise on per-file errors.
+    - `chunking_strategy` picks which node parser to build (see
+      ingestion/chunking_strategies.SUPPORTED_CHUNKING_STRATEGIES). Default
+      is "fixed_512" which reproduces the pre-factory behaviour
+      (SentenceSplitter, 512/50) for back-compat with existing ingests.
+    - `collection_name` defaults to the strategy's canonical collection
+      (fixed_512 → `pm_onboarding`, fixed_768 → `kb_768`, etc.) — callers
+      can override to experiment with arbitrary collection names.
+
+    Creates `docs_dir` if missing. Returns an IngestionStats; does not
+    raise on per-file errors (those are logged and accumulated).
     """
+    if chunking_strategy not in SUPPORTED_CHUNKING_STRATEGIES:
+        raise ValueError(
+            f"Unsupported chunking_strategy {chunking_strategy!r}. "
+            f"Must be one of {SUPPORTED_CHUNKING_STRATEGIES}."
+        )
+    if collection_name is None:
+        collection_name = DEFAULT_COLLECTION_BY_STRATEGY[chunking_strategy]
+
     docs_path = Path(docs_dir).resolve()
     if not docs_path.exists():
         docs_path.mkdir(parents=True, exist_ok=True)
@@ -308,17 +332,16 @@ def ingest_pod(pod: str, docs_dir: str = "./docs") -> IngestionStats:
         logger.warning("No supported files found under %s", docs_path)
         return stats
 
-    logger.info("Found %d candidate file(s) under %s", len(files), docs_path)
+    logger.info(
+        "Found %d candidate file(s) under %s (strategy=%s, collection=%s)",
+        len(files), docs_path, chunking_strategy, collection_name,
+    )
 
-    collection = _get_collection()
+    collection = _get_collection(collection_name)
     verify_collection_dim(collection)
     vector_store = ChromaVectorStore(chroma_collection=collection)
-    splitter = SentenceSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        paragraph_separator="\n\n",
-    )
     embed_model = get_embed_model()
+    splitter = build_splitter(chunking_strategy, embed_model=embed_model)
     pipeline = IngestionPipeline(
         transformations=[splitter, embed_model],
         vector_store=vector_store,
@@ -358,13 +381,36 @@ def main() -> None:
     """CLI entry point. Exits non-zero only when every file errored."""
     _configure_logging()
     parser = argparse.ArgumentParser(
-        description="Ingest local documents into the pm_onboarding ChromaDB collection.",
+        description="Ingest local documents into a ChromaDB collection.",
     )
     parser.add_argument("--pod", required=True, help="Pod name to tag the ingested chunks with")
     parser.add_argument("--docs-dir", default="./docs", help="Root directory to scan recursively")
+    parser.add_argument(
+        "--chunking",
+        default=DEFAULT_CHUNKING_STRATEGY,
+        choices=list(SUPPORTED_CHUNKING_STRATEGIES),
+        help=(
+            "Chunking strategy. fixed_512/768/1024 are SentenceSplitter variants; "
+            "semantic uses SemanticSplitterNodeParser (topic-boundary splits)."
+        ),
+    )
+    parser.add_argument(
+        "--collection-name",
+        default=None,
+        help=(
+            "Target Chroma collection. Defaults to the strategy's canonical "
+            "collection (fixed_512→pm_onboarding, fixed_768→kb_768, "
+            "fixed_1024→kb_1024, semantic→kb_semantic)."
+        ),
+    )
     args = parser.parse_args()
 
-    stats = ingest_pod(pod=args.pod, docs_dir=args.docs_dir)
+    stats = ingest_pod(
+        pod=args.pod,
+        docs_dir=args.docs_dir,
+        chunking_strategy=args.chunking,
+        collection_name=args.collection_name,
+    )
     _print_summary(args.pod, stats)
 
     failed_only = stats.errors > 0 and stats.files_processed == 0
