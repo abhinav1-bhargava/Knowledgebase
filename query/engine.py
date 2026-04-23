@@ -114,6 +114,12 @@ _embed_model = None
 _llm = None
 _index = None
 
+# Per-collection caches, populated on demand when retrieval targets a
+# non-default collection (the RAG Lab compares across kb_768, kb_1024,
+# kb_semantic alongside the default pm_onboarding).
+_collections_by_name: dict[str, object] = {}
+_indexes_by_name: dict[str, "VectorStoreIndex"] = {}
+
 
 def _get_collection():
     global _collection
@@ -121,6 +127,13 @@ def _get_collection():
         client = chromadb.PersistentClient(path=CHROMA_PATH)
         _collection = client.get_or_create_collection(name=COLLECTION_NAME)
     return _collection
+
+
+def _get_collection_by_name(name: str):
+    if name not in _collections_by_name:
+        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        _collections_by_name[name] = client.get_or_create_collection(name=name)
+    return _collections_by_name[name]
 
 
 def _get_embed_model():
@@ -170,6 +183,17 @@ def _get_index() -> VectorStoreIndex:
     return _index
 
 
+def _get_index_for(collection_name: str) -> VectorStoreIndex:
+    if collection_name not in _indexes_by_name:
+        col = _get_collection_by_name(collection_name)
+        vector_store = ChromaVectorStore(chroma_collection=col)
+        _indexes_by_name[collection_name] = VectorStoreIndex.from_vector_store(
+            vector_store=vector_store,
+            embed_model=_get_embed_model(),
+        )
+    return _indexes_by_name[collection_name]
+
+
 def reset_clients() -> None:
     """Drop cached Chroma/embedding/LLM/index instances. Mainly for tests."""
     global _collection, _embed_model, _llm, _index
@@ -177,15 +201,29 @@ def reset_clients() -> None:
     _embed_model = None
     _llm = None
     _index = None
+    _collections_by_name.clear()
+    _indexes_by_name.clear()
 
 
 # --- Retrieval --------------------------------------------------------------
 
 
-def _retrieve(question: str, pod: str | None, top_k: int) -> list[dict]:
-    """Retrieve top_k chunks, optionally filtered by pod metadata."""
-    verify_collection_dim(_get_collection())
-    index = _get_index()
+def _retrieve(
+    question: str,
+    pod: str | None,
+    top_k: int,
+    collection_name: str | None = None,
+) -> list[dict]:
+    """Retrieve top_k chunks, optionally filtered by pod and targeting a
+    named collection. `collection_name=None` falls through to the default
+    singleton collection for back-compat."""
+    if collection_name is None:
+        col = _get_collection()
+        index = _get_index()
+    else:
+        col = _get_collection_by_name(collection_name)
+        index = _get_index_for(collection_name)
+    verify_collection_dim(col)
     filters = None
     if pod:
         filters = MetadataFilters(
@@ -279,22 +317,20 @@ def _llm_chat(llm, system_prompt: str, user_prompt: str) -> str:
 # --- Public entry point -----------------------------------------------------
 
 
-def query(
+def _generate_from_chunks(
     question: str,
-    pod: str | None = None,
-    top_k: int | None = None,
+    retrieved: list[dict],
+    pod: str | None,
+    start: float | None = None,
 ) -> QueryResult:
-    """Answer a question over the indexed corpus.
+    """Generate the QueryResult from already-retrieved chunks.
 
-    Retrieves top-K chunks (optionally filtered by pod), asks the LLM to
-    answer using only the retrieved context, parses follow-ups out of the
-    response, and logs the query (plus a gap record if confidence is
-    below CONFIDENCE_THRESHOLD).
+    Shared by every retrieval strategy so confidence/LLM/citation/logging
+    behaviour stays identical across naive, rewriting, hybrid, reranked,
+    agentic, and sentence-window.
     """
-    start = time.time()
-    effective_top_k = top_k or RETRIEVAL_TOP_K
-
-    retrieved = _retrieve(question, pod, effective_top_k)
+    if start is None:
+        start = time.time()
 
     if not retrieved:
         answer = "No sources found for this question."
@@ -370,6 +406,83 @@ def query(
         len(retrieved),
     )
     return result
+
+
+def query(
+    question: str,
+    pod: str | None = None,
+    top_k: int | None = None,
+    collection_name: str | None = None,
+) -> QueryResult:
+    """Naive RAG: embed → retrieve top-K → generate.
+
+    Retrieves top-K chunks (optionally filtered by pod, optionally
+    targeting a non-default collection), asks the LLM to answer using
+    only the retrieved context, parses follow-ups, and logs the query
+    (plus a gap record if confidence is below CONFIDENCE_THRESHOLD).
+    """
+    start = time.time()
+    effective_top_k = top_k or RETRIEVAL_TOP_K
+    retrieved = _retrieve(question, pod, effective_top_k, collection_name=collection_name)
+    return _generate_from_chunks(question, retrieved, pod, start=start)
+
+
+# Alias exposing the naive path under the naming convention the RAG Lab
+# uses across all six strategies (query_naive / query_with_rewriting /
+# query_hybrid / query_reranked / query_agentic / query_sentence_window).
+def query_naive(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+) -> QueryResult:
+    """Naive RAG — same as `query`, with RAG-Lab-shaped signature."""
+    return query(question, pod=pod, top_k=top_k, collection_name=collection_name)
+
+
+def query_with_rewriting(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+) -> QueryResult:
+    """Retrieve with rephrased query variants and merge results.
+
+    Strategy: expand the original question into up to 3 phrasings via
+    the LLM (original + 2 rewrites), retrieve top-K chunks for each, then
+    deduplicate on chunk text keeping the highest score per chunk. The
+    deduped, re-sorted top-K is passed to the same generation path the
+    naive query uses, so downstream logging and citation shape stay
+    identical.
+
+    Expect ~3× the embedding / retrieval cost of naive, plus one LLM
+    call for the rewrite. Falls back to naive if the rewrite LLM fails
+    (rewrite_query returns [original] only).
+    """
+    from query.rewriting import rewrite_query
+
+    start = time.time()
+    effective_top_k = top_k or RETRIEVAL_TOP_K
+
+    variants = rewrite_query(question)
+    logger.info("Rewriting produced %d variant(s)", len(variants))
+
+    all_hits: list[dict] = []
+    for variant in variants:
+        hits = _retrieve(variant, pod, effective_top_k, collection_name=collection_name)
+        all_hits.extend(hits)
+
+    # Dedupe by chunk text, keep the highest score seen for each.
+    seen: dict[str, dict] = {}
+    for hit in all_hits:
+        key = hit.get("text") or ""
+        if not key:
+            continue
+        if key not in seen or hit["score"] > seen[key]["score"]:
+            seen[key] = hit
+
+    deduped = sorted(seen.values(), key=lambda c: c["score"], reverse=True)[:effective_top_k]
+    return _generate_from_chunks(question, deduped, pod, start=start)
 
 
 # --- CLI --------------------------------------------------------------------
