@@ -32,7 +32,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from design.styles import apply_design_system, render_badge
+from design.styles import apply_design_system
 
 st.set_page_config(
     page_title="RAG Experimentation Lab",
@@ -352,28 +352,40 @@ def _render_result(col, payload: dict[str, Any]) -> None:
             st.info("No result.")
             return
 
-        # Confidence
-        pct = int(round((result.confidence or 0.0) * 100))
-        if result.confidence >= 0.8:
-            variant = "success"
-        elif result.confidence >= 0.5:
-            variant = "warn"
+        # Prominent confidence display — 32px number with a small label
+        # above it, coloured green/yellow/red at the design-system
+        # semantic thresholds. Guards against a None/missing confidence.
+        confidence = result.confidence if result.confidence is not None else 0.0
+        pct = int(round(confidence * 100))
+        if confidence >= 0.8:
+            conf_color = "var(--success-600)"
+        elif confidence >= 0.5:
+            conf_color = "var(--warn-600)"
         else:
-            variant = "danger"
+            conf_color = "var(--danger-600)"
         st.markdown(
-            f"**Confidence** &nbsp;"
-            f"{render_badge(f'{pct}%', variant=variant)}",
+            f'<div style="text-align: center; margin: 12px 0 20px 0;">'
+            f'<div style="font-size: 11px; color: var(--ink-500); '
+            f'text-transform: uppercase; letter-spacing: 0.06em; '
+            f'font-weight: 500;">Confidence</div>'
+            f'<div style="font-size: 32px; font-weight: 600; color: {conf_color}; '
+            f'line-height: 1.1; margin-top: 4px; '
+            f'font-variant-numeric: tabular-nums;">{pct}%</div>'
+            f"</div>",
             unsafe_allow_html=True,
         )
 
-        # Key metrics row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Latency (s)", f"{latency:.2f}")
-        m2.metric("Chunks", len(result.citations or []))
+        # 2×2 metric grid — each column gets half the width of a
+        # one-third page column, so values no longer truncate the way
+        # they did in the old 4-across layout.
         tokens = _estimate_tokens(result.answer)
-        m3.metric("Tokens", f"~{tokens}")
         cost = tokens * TOKEN_COST_INR
-        m4.metric("Est. cost", f"₹{cost:.4f}")
+        r1a, r1b = st.columns(2)
+        r1a.metric("Latency (s)", f"{latency:.2f}")
+        r1b.metric("Chunks", len(result.citations or []))
+        r2a, r2b = st.columns(2)
+        r2a.metric("Tokens", f"~{tokens}")
+        r2b.metric("Est. cost", f"₹{cost:.3f}")
 
         # Answer + sources
         with st.expander("Answer", expanded=True):
