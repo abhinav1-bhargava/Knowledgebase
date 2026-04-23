@@ -350,6 +350,25 @@ def ingest_pod(
     for file_path in files:
         _ingest_file(file_path, docs_path, pod, collection, pipeline, stats)
 
+    # Auto-rebuild the BM25 keyword index for this collection if anything
+    # actually changed. Hybrid search goes stale against fresh uploads
+    # otherwise; rebuild is cheap (whole-corpus re-tokenize + re-index,
+    # seconds for ~1000 docs). Failures here must NOT break ingestion —
+    # the vector side is already persisted; log and continue.
+    if stats.files_processed > 0 or stats.files_replaced > 0:
+        try:
+            from query.bm25_index import build_bm25_index
+
+            build_bm25_index(collection_name)
+            logger.info(
+                "BM25 index rebuilt for collection %s (post-ingest)", collection_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "BM25 index rebuild failed for collection %s (ingestion itself was OK): %s",
+                collection_name, exc,
+            )
+
     return stats
 
 

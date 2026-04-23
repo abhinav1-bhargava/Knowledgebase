@@ -556,6 +556,44 @@ def query_hybrid(
     return _generate_from_chunks(question, top, pod, start=start)
 
 
+# How many candidates to pull into the cross-encoder before trimming to
+# top_k. Wide net = more reranker headroom; cost is linear in this number.
+_RERANK_CANDIDATES = 50
+
+
+def query_reranked(
+    question: str,
+    pod: str | None = None,
+    collection_name: str | None = None,
+    top_k: int | None = None,
+) -> QueryResult:
+    """Two-stage retrieval: vector top-50 → cross-encoder → top-K.
+
+    Uses `cross-encoder/ms-marco-MiniLM-L-6-v2` to score every
+    (question, chunk) pair among the top-50 vector hits and keeps the
+    `top_k` highest-scoring (default 10). The original vector `score`
+    is preserved on each chunk so the downstream confidence metric
+    (mean similarity in _generate_from_chunks) stays comparable across
+    strategies; rerank_score is attached but not substituted in.
+
+    First call pays a one-time model-load cost (~23MB download, 5–10s);
+    subsequent calls are dominated by the per-pair inference pass
+    which is ~linear in `_RERANK_CANDIDATES`.
+    """
+    from query.reranker import rerank
+
+    start = time.time()
+    effective_top_k = top_k or 10  # spec default for reranked is 10
+    wide_k = max(_RERANK_CANDIDATES, effective_top_k * 3)
+
+    candidates = _retrieve(question, pod, wide_k, collection_name=collection_name)
+    if not candidates:
+        return _generate_from_chunks(question, [], pod, start=start)
+
+    reranked = rerank(question, candidates, top_k=effective_top_k)
+    return _generate_from_chunks(question, reranked, pod, start=start)
+
+
 # --- CLI --------------------------------------------------------------------
 
 
